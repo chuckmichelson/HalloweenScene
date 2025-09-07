@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spooky Eyes – Reduced Vergence</title>
+  <style>
+    html, body { height: 100%; margin: 0; background:#000; }
+    .wrap { height: 100%; display: grid; place-items: center; }
+    canvas { display: block; max-width: 100vw; max-height: 100vh; }
+    .hud { position: fixed; left: 12px; top: 12px; color: #9ff; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; opacity: 0.9; }
+    .hud .badge { display:inline-block; padding:2px 6px; border-radius:6px; background:#124; margin-left:6px; }
+    video { display:none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="stage"></canvas>
+  </div>
+  <div class="hud">
+    <div><strong>Spooky Eyes</strong> <span id="camStatus" class="badge">camera: off</span></div>
+    <div>Camera-only • Parallelized gaze (reduced vergence) • Micro‑saccades • Luminance-reactive pupils</div>
+  </div>
+  <video id="camera" playsinline muted></video>
+
+  <script type="module">
+  // =============================================================
+  // CONFIG – tweak freely
+  // =============================================================
+  const CONFIG = {
+    // Artwork
+    bgUrl: "background.png", // e.g. "bg.jpg"
+    fgUrl: "foreground.png", // e.g. "mask.png"
+
+    // Canvas logical size when bg not provided
+    width: 1920,
+    height: 1080,
+
+    // Eye positions (center and master radius per pair)
+    eyes: [
+      { x: 260,  y: 595,  r: 220 },
+      { x: 330,  y: 823,  r: 230 },
+      { x: 506,  y: 402,  r: 240 },
+      { x: 645,  y: 693,  r: 310 },
+      { x: 810,  y: 300,  r: 260 },
+      { x: 953,  y: 817,  r: 220 },
+      { x: 1125, y: 488,  r: 270 },
+      { x: 1331, y: 747,  r: 240 },
+    ],
+
+
+    // Eye geometry/style (ratios)
+    scleraR: 0.43,
+    irisR:   0.20,
+    limbalW: 0.028,
+    pupilMin: 0.040,
+    pupilMax: 0.18,
+
+    // Gaze behaviour
+    gaze: {
+      mirrorCamera: true,   // mirror horizontally like a selfie
+      range: 0.36,          // max pupil offset as fraction of r
+      smooth: 0.18,         // low-pass smoothing 0..1
+      vergence: 0.30        // 0 = parallel (far fixation), 1 = converge to point (near)
+    },
+
+    // Blinks
+    blinkMinDelay: 12.0,
+    blinkMaxDelay: 24.0,
+    blinkDur: 0.15,
+
+    // Micro‑saccades & tremor
+    micro: {
+      saccadeEveryMin: 0.6,
+      saccadeEveryMax: 1.8,
+      saccadeAmpMin: 0.005,
+      saccadeAmpMax: 0.02,
+      saccadeDurMin: 0.025,
+      saccadeDurMax: 0.060,
+      tremorHz1: 7.0,
+      tremorHz2: 12.0,
+      tremorAmp: 0.006
+    },
+
+    // Pupil response to camera luminance
+    luminance: {
+      sampleSize: 64,   // downsample N x N
+      smooth: 0.15,     // EMA smooth 0..1
+      targetLag: 0.25,  // seconds (per-eye varied)
+      gamma: 0.8,       // brightness curve
+      jitter: 0.03      // per-eye randomness on target fraction
+    }
+  };
+
+  // =============================================================
+  // Helpers
+  // =============================================================
+  const lerp = (a,b,t)=> a + (b-a)*t;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const now = () => performance.now() / 1000;
+  const rr = (lo,hi)=> lo + Math.random()*(hi-lo);
+
+  // =============================================================
+  // Canvas & assets
+  // =============================================================
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const canvas = document.getElementById('stage');
+  const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
+  const camStatus = document.getElementById('camStatus');
+  const bg = new Image();
+  const fg = new Image();
+  let bgReady=false, fgReady=false;
+
+  function setCanvasSize(w,h){
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  if (CONFIG.bgUrl){ bg.onload = ()=>{ bgReady=true; setCanvasSize(bg.naturalWidth, bg.naturalHeight); }; bg.src = CONFIG.bgUrl; }
+  else setCanvasSize(CONFIG.width, CONFIG.height);
+  if (CONFIG.fgUrl){ fg.onload = ()=> fgReady=true; fg.src = CONFIG.fgUrl; }
+
+  // =============================================================
+  // Eye class
+  // =============================================================
+  class Eye {
+    constructor({x,y,r}, i){
+      this.x=x; this.y=y; this.r=r; this.i=i;
+      this.gx=x; this.gy=y; // global gaze mapped for this eye
+      this.pcX=x; this.pcY=y; // pupil center (smoothed)
+
+      // Pupil dynamics (absolute pixels)
+      this.pupil = 0.10 * r;
+      this.pupilTarget = this.pupil;
+      this.pupilLag = CONFIG.luminance.targetLag * rr(0.8, 1.3);
+      this.pupilGain = rr(0.9, 1.1);
+
+      // Blink
+      this.nextBlinkAt = now() + rr(CONFIG.blinkMinDelay, CONFIG.blinkMaxDelay);
+      this.blinkPhase = 0; // 0 open, 1 closed (with transitions)
+      this.blinkT = 0;
+
+      // Micro‑saccade scheduling
+      this.nextSaccadeAt = now() + rr(CONFIG.micro.saccadeEveryMin, CONFIG.micro.saccadeEveryMax);
+      this.sdx=0; this.sdy=0; this.sEnd=0;
+
+      // Tremor phases
+      this.ph1 = Math.random()*Math.PI*2;
+      this.ph2 = Math.random()*Math.PI*2;
+    }
+
+    setGlobalGaze(x,y){ this.gx = x; this.gy = y; }
+
+    update(dt, t, globalBrightness){
+      // Blink FSM
+      if (t >= this.nextBlinkAt && this.blinkPhase === 0){ this.blinkPhase = 0.0001; this.blinkT = 0; }
+      if (this.blinkPhase > 0){
+        this.blinkT += dt;
+        if (this.blinkPhase < 1){ if (this.blinkT >= CONFIG.blinkDur){ this.blinkPhase = 1; this.blinkT = 0; } }
+        else if (this.blinkPhase < 2){ if (this.blinkT >= CONFIG.blinkDur){ this.blinkPhase = 0; this.blinkT = 0; this.nextBlinkAt = t + rr(CONFIG.blinkMinDelay, CONFIG.blinkMaxDelay); } }
+      }
+
+      // Micro‑saccade
+      if (t >= this.nextSaccadeAt && t > this.sEnd){
+        const amp = rr(CONFIG.micro.saccadeAmpMin, CONFIG.micro.saccadeAmpMax) * this.r;
+        const ang = Math.random()*Math.PI*2;
+        this.sdx = Math.cos(ang)*amp; this.sdy = Math.sin(ang)*amp;
+        const dur = rr(CONFIG.micro.saccadeDurMin, CONFIG.micro.saccadeDurMax);
+        this.sEnd = t + dur;
+        this.nextSaccadeAt = t + rr(CONFIG.micro.saccadeEveryMin, CONFIG.micro.saccadeEveryMax);
+      }
+      if (t >= this.sEnd){ this.sdx *= 0.85; this.sdy *= 0.85; }
+
+      // Tremor
+      const tremA = CONFIG.micro.tremorAmp * this.r;
+      const tremX = Math.sin(t*CONFIG.micro.tremorHz1*2*Math.PI + this.ph1) * tremA * 0.5
+                  + Math.sin(t*CONFIG.micro.tremorHz2*2*Math.PI + this.ph2) * tremA * 0.5;
+      const tremY = Math.cos(t*CONFIG.micro.tremorHz1*2*Math.PI + this.ph1) * tremA * 0.5
+                  + Math.cos(t*CONFIG.micro.tremorHz2*2*Math.PI + this.ph2) * tremA * 0.5;
+
+      // Combine gaze + micro offsets, constrain to range
+      const dx = (this.gx + this.sdx + tremX) - this.x;
+      const dy = (this.gy + this.sdy + tremY) - this.y;
+      const maxOff = this.r * CONFIG.gaze.range;
+      const dist = Math.hypot(dx,dy) + 1e-6;
+      const scl = Math.min(1, maxOff / dist);
+      const tx = this.x + dx*scl;
+      const ty = this.y + dy*scl;
+
+      // Smooth pursuit
+      this.pcX = lerp(this.pcX, tx, CONFIG.gaze.smooth);
+      this.pcY = lerp(this.pcY, ty, CONFIG.gaze.smooth);
+
+      // Pupil size from luminance (global -> per-eye)
+      const L = Math.pow(clamp(globalBrightness,0,1), CONFIG.luminance.gamma);
+      const base = lerp(CONFIG.pupilMax, CONFIG.pupilMin, L); // bright -> smaller
+      const jitter = (Math.random()*2-1) * CONFIG.luminance.jitter * (CONFIG.pupilMax - CONFIG.pupilMin);
+      const frac = clamp(base + jitter, CONFIG.pupilMin, CONFIG.pupilMax);
+      const targetPx = frac * this.r * this.pupilGain;
+      const alpha = clamp(dt / (this.pupilLag + 1e-6), 0, 1);
+      this.pupil = lerp(this.pupil, targetPx, alpha);
+    }
+
+    draw(ctx){
+      const r = this.r;
+      const scleraR = r * CONFIG.scleraR;
+      const irisR   = r * CONFIG.irisR;
+      const limbalW = Math.max(1, r * CONFIG.limbalW);
+      const pupilR  = clamp(this.pupil, r*CONFIG.pupilMin, r*CONFIG.pupilMax);
+
+      // Blink amount 0..1
+      let blinkAmt = 0;
+      if (this.blinkPhase > 0 && this.blinkPhase < 1) blinkAmt = clamp(this.blinkT/CONFIG.blinkDur, 0, 1);
+      else if (this.blinkPhase === 1) blinkAmt = 1;
+      else if (this.blinkPhase > 1) blinkAmt = clamp(1 - this.blinkT/CONFIG.blinkDur, 0, 1);
+
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.scale(1.12, 0.96);
+
+      // Clip to eye oval
+      ctx.beginPath(); ctx.arc(0,0, scleraR, 0, Math.PI*2); ctx.clip();
+
+      // Sclera
+      const gradS = ctx.createRadialGradient(-scleraR*0.2, -scleraR*0.2, scleraR*0.2, 0, 0, scleraR);
+      gradS.addColorStop(0, '#f9fbff'); gradS.addColorStop(1, '#cfd7e6');
+      ctx.fillStyle = gradS; ctx.fillRect(-scleraR, -scleraR, scleraR*2, scleraR*2);
+
+      // Iris
+      const ix = (this.pcX - this.x) / 1.12;
+      const iy = (this.pcY - this.y) / 0.96;
+      const gradI = ctx.createRadialGradient(ix, iy, irisR*0.15, ix, iy, irisR);
+      gradI.addColorStop(0, '#a9cfe9');
+      gradI.addColorStop(0.55, '#1b5d7e');
+      gradI.addColorStop(1, '#0b2432');
+      ctx.beginPath(); ctx.arc(ix, iy, irisR, 0, Math.PI*2); ctx.fillStyle = gradI; ctx.fill();
+
+      // Limbal ring
+      ctx.lineWidth = limbalW; ctx.strokeStyle = 'rgba(10,20,30,0.9)';
+      ctx.beginPath(); ctx.arc(ix, iy, irisR, 0, Math.PI*2); ctx.stroke();
+
+      // Pupil + highlight
+      ctx.beginPath(); ctx.arc(ix, iy, pupilR, 0, Math.PI*2); ctx.fillStyle = '#000'; ctx.fill();
+      ctx.globalAlpha = 0.6; ctx.beginPath(); ctx.arc(ix - pupilR*0.5, iy - pupilR*0.6, pupilR*0.35, 0, Math.PI*2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.globalAlpha = 1;
+
+      // Eyelids
+      if (blinkAmt > 0){ const h = scleraR * blinkAmt; ctx.fillStyle = '#000'; ctx.fillRect(-scleraR-2, -scleraR-2, scleraR*2+4, h+2); ctx.fillRect(-scleraR-2, scleraR-h-0, scleraR*2+4, h+2); }
+      ctx.restore();
+
+      // Outer shadow
+      ctx.save(); ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = r*0.2; ctx.shadowOffsetY = r*0.07; ctx.beginPath(); ctx.arc(this.x, this.y, scleraR*1.02, 0, Math.PI*2); ctx.strokeStyle = 'rgba(0,0,0,0.001)'; ctx.stroke(); ctx.restore();
+    }
+  }
+
+  // Create eyes
+  const eyes = CONFIG.eyes.map((def,i)=> new Eye(def,i));
+
+  // =============================================================
+  // Camera + MediaPipe Face Landmarker
+  // =============================================================
+  const video = document.getElementById('camera');
+  let faceLandmarker = null; let lastVideoTime = -1;
+
+  // Luminance sampling
+  const lumSize = CONFIG.luminance.sampleSize;
+  const lumCanvas = document.createElement('canvas');
+  lumCanvas.width = lumSize; lumCanvas.height = lumSize;
+  const lumCtx = lumCanvas.getContext('2d', { willReadFrequently: true });
+  let brightness = 0.2; // EMA 0..1
+
+  async function initCameraAndTracker(){
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width:{ideal: 640}, height:{ideal: 480} }, audio:false });
+      video.srcObject = stream; await video.play();
+      const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0');
+      const filesetResolver = await vision.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm');
+      faceLandmarker = await vision.FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task' },
+        runningMode: 'VIDEO', numFaces: 1
+      });
+      camStatus.textContent = 'camera: on'; camStatus.style.background = '#1a3';
+    }catch(e){ camStatus.textContent = 'camera: blocked'; camStatus.style.background = '#631'; console.warn(e); }
+  }
+
+  function extractNormalizedGaze(result){
+    if (!result || !result.faceLandmarks || result.faceLandmarks.length===0) return null;
+    const lm = result.faceLandmarks[0];
+    const RIGHT_IRIS = [468, 469, 470, 471, 472];
+    const LEFT_IRIS  = [473, 474, 475, 476, 477];
+    function avgXY(indices){ let sx=0, sy=0, n=0; for (const i of indices){ const p=lm[i]; if (!p) continue; sx+=p.x; sy+=p.y; n++; } return n? {x:sx/n,y:sy/n}:null; }
+    let rI=avgXY(RIGHT_IRIS), lI=avgXY(LEFT_IRIS);
+    if (!rI || !lI){ const R_EYE=[33,133], L_EYE=[362,263]; rI=avgXY(R_EYE); lI=avgXY(L_EYE); }
+    if (!rI || !lI) return null;
+    let nx = (rI.x + lI.x) * 0.5; let ny = (rI.y + lI.y) * 0.5;
+    if (CONFIG.gaze.mirrorCamera) nx = 1 - nx;
+    // Direction vector relative to center (parallel gaze model)
+    let dirX = (nx - 0.5) * 2; let dirY = (ny - 0.5) * 2;
+    const len = Math.hypot(dirX, dirY);
+    let dirMag = Math.min(1, len);
+    if (len > 1e-6){ dirX /= Math.max(1, len); dirY /= Math.max(1, len); }
+    return { nx, ny, dirX, dirY, dirMag };
+  }
+
+  function updateBrightness(){
+    try{
+      const w = video.videoWidth, h = video.videoHeight; if (!w || !h) return;
+      const S = lumSize; lumCtx.drawImage(video, 0, 0, S, S);
+      const data = lumCtx.getImageData(0,0,S,S).data;
+      let sum = 0; for (let i=0; i<data.length; i+=4){ const r=data[i], g=data[i+1], b=data[i+2]; const Y=0.2126*r+0.7152*g+0.0722*b; sum += Y; }
+      const avg = (sum / (S*S)) / 255; brightness = lerp(brightness, avg, CONFIG.luminance.smooth);
+    }catch{ /* ignore */ }
+  }
+
+  function processVideo(){
+    if (!faceLandmarker || video.readyState < 2){ requestAnimationFrame(processVideo); return; }
+    const tMs = performance.now();
+    if (lastVideoTime !== video.currentTime){
+      const res = faceLandmarker.detectForVideo(video, tMs);
+      const gz = extractNormalizedGaze(res);
+      updateBrightness();
+      if (gz){
+        const canvasW = (canvas.width / dpr), canvasH = (canvas.height / dpr);
+        // Convergent point (near)
+        const pointX = gz.nx * canvasW, pointY = gz.ny * canvasH;
+        // Parallel direction (far)
+        const dirX = gz.dirX, dirY = gz.dirY, dirMag = gz.dirMag;
+        for (const e of eyes){
+          const maxOff = e.r * CONFIG.gaze.range;
+          // Directional target: offset from eye center along shared direction
+          const dirOffLen = maxOff * dirMag;
+          const dirTx = e.x + dirX * dirOffLen;
+          const dirTy = e.y + dirY * dirOffLen;
+          // Point target: converge to same canvas point (clamped by range)
+          const dx = pointX - e.x, dy = pointY - e.y;
+          const scl = Math.min(1, maxOff / (Math.hypot(dx,dy) + 1e-6));
+          const ptTx = e.x + dx * scl, ptTy = e.y + dy * scl;
+          // Blend by vergence
+          const v = clamp(CONFIG.gaze.vergence, 0, 1);
+          const gx = lerp(ptTx, dirTx, 1 - v);
+          const gy = lerp(ptTy, dirTy, 1 - v);
+          e.setGlobalGaze(gx, gy);
+        }
+      }
+      lastVideoTime = video.currentTime;
+    }
+    requestAnimationFrame(processVideo);
+  }
+
+  // =============================================================
+  // Main render loop
+  // =============================================================
+  let lastT = now();
+  function frame(){
+    const t = now(); const dt = Math.min(0.05, t - lastT); lastT = t;
+    if (bgReady) ctx.drawImage(bg, 0, 0); else { ctx.fillStyle = '#05080a'; ctx.fillRect(0,0,canvas.width/dpr, canvas.height/dpr); }
+    for (const e of eyes){ e.update(dt, t, brightness); e.draw(ctx); }
+    if (fgReady) ctx.drawImage(fg, 0, 0);
+    requestAnimationFrame(frame);
+  }
+
+  // Kickoff
+  await initCameraAndTracker();
+  requestAnimationFrame(processVideo);
+  requestAnimationFrame(frame);
+
+  // Responsive fit (logical size stays constant unless bg sets it)
+  function fitToViewport(){ if (!CONFIG.bgUrl){ const vw=Math.min(window.innerWidth, CONFIG.width); const vh=Math.min(window.innerHeight, CONFIG.height); canvas.style.width=vw+'px'; canvas.style.height=vh+'px'; } }
+  window.addEventListener('resize', fitToViewport); fitToViewport();
+  </script>
+</body>
+</html>
