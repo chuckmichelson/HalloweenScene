@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="shortcut icon" href="favicon.ico">
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Spooky Eyes – Reduced Vergence</title>
@@ -19,18 +22,21 @@
   </div>
   <div class="hud">
     <div><strong>Spooky Eyes</strong> <span id="camStatus" class="badge">camera: off</span></div>
+    <button id="soundToggle" class="badge" style="cursor:pointer">sound: off</button>
     <div>Camera-only • Parallelized gaze (reduced vergence) • Micro‑saccades • Luminance-reactive pupils</div>
   </div>
   <video id="camera" playsinline muted></video>
 
   <script type="module">
+
   // =============================================================
   // CONFIG – tweak freely
   // =============================================================
   const CONFIG = {
     // Artwork
-    bgUrl: "background.png", // e.g. "bg.jpg"
-    fgUrl: "foreground.png", // e.g. "mask.png"
+    // Artwork
+    bgUrl: "background.png",
+    fgUrl: "foreground.png",
 
     // Canvas logical size when bg not provided
     width: 1920,
@@ -92,6 +98,21 @@
     }
   };
 
+  // Sprite config
+  const SPRITE = {
+    spiderUrl: 'spider32.png',
+    cols: 8, rows: 4, total: 32,
+    fps: 60, count: 1,
+    rotationOffset: -Math.PI / 2   // rotate 90° clockwise; swap sign if you need CCW
+  };
+
+
+// Spider sprite sheet
+const spiderSheet = new Image();
+let spiderReady = false;
+spiderSheet.onload = () => spiderReady = true;
+spiderSheet.src = SPRITE.spiderUrl; // 'spider32.png' in the same folder
+
   // =============================================================
   // Helpers
   // =============================================================
@@ -99,6 +120,219 @@
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const now = () => performance.now() / 1000;
   const rr = (lo,hi)=> lo + Math.random()*(hi-lo);
+
+class SpriteRunner {
+  constructor(img, cols, rows, total, fps){
+    this.img = img; this.cols = cols; this.rows = rows;
+    this.total = total; this.fps = fps;
+    this.accum = 0; this.f = 0;
+
+    // offscreen buffer for tinting without boxing the background
+    this.buf = document.createElement('canvas');
+    this.bctx = this.buf.getContext('2d');
+  }
+  step(dt){
+    this.accum += dt * this.fps;
+    const adv = this.accum|0;
+    if (adv > 0){ this.f = (this.f + adv) % this.total; this.accum -= adv; }
+  }
+  draw(ctx, x, y, scale=1, angleRad=0, tintSilhouette=true){
+    if (!this.img.complete || !this.img.naturalWidth) return;
+
+    const fw = this.img.naturalWidth  / this.cols;
+    const fh = this.img.naturalHeight / this.rows;
+    if (this.buf.width !== fw || this.buf.height !== fh){
+      this.buf.width = fw; this.buf.height = fh;
+    }
+
+    const c = this.f % this.cols, r = (this.f / this.cols) | 0;
+    const sx = c * fw, sy = r * fh;
+
+    // --- draw current frame into the offscreen ---
+    this.bctx.clearRect(0, 0, fw, fh);
+    this.bctx.drawImage(this.img, sx, sy, fw, fh, 0, 0, fw, fh);
+
+    // optional near-silhouette tint, masked by sprite alpha only
+    if (tintSilhouette){
+      this.bctx.globalCompositeOperation = 'source-atop';
+      this.bctx.fillStyle = 'rgba(0,0,0,0.55)';
+      this.bctx.fillRect(0, 0, fw, fh);
+      this.bctx.globalCompositeOperation = 'source-over';
+    }
+
+    // --- paint to main canvas, rotated to travel direction ---
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(angleRad + (SPRITE.rotationOffset || 0));
+    ctx.scale(scale, scale);
+    // anchor at bottom-center
+    ctx.drawImage(this.buf, -fw/2, -fh, fw, fh);
+    ctx.restore();
+  }
+}
+
+// =============================================================
+// Sound Manager
+// =============================================================
+class SoundMgr {
+  constructor() {
+    // asset paths (put your actual filenames here)
+    this.paths = {
+      swamp:   'swamp.mp3',
+      crows:   'crows.mp3',
+      owl:     'owl.mp3',
+      raven:   'raven.mp3',
+      monster: 'monster.mp3',
+      footsteps: 'footsteps.mp3',
+    };
+
+    // random interval ranges in seconds
+    this.ranges = {
+      crows:   [20, 40],
+      owl:     [10, 30],
+      raven:   [30, 60],
+      monster: [60, 90],
+      footsteps: [90, 120],
+    };
+
+    // background loop
+    this.bg = new Audio(this.paths.swamp);
+    this.bg.loop = true;
+    this.bg.volume = 0.35; // ambience level
+
+    // state
+    this.enabled = false;
+    this.timers = [];
+  }
+
+  // helper: random delay in ms
+  rdelay([a, b]) { return (a + Math.random() * (b - a)) * 1000; }
+
+  // play a one-shot (new element so overlaps are allowed)
+  playOne(name, vol = 0.8) {
+    const a = new Audio(this.paths[name]);
+    a.volume = vol;
+    // fire-and-forget
+    a.play().catch(() => { /* ignore if user gesture missing */ });
+  }
+
+  // schedule a repeating timed sound
+  schedule(name, vol = 0.8) {
+    const scheduleNext = () => {
+      if (!this.enabled) return;
+      const t = setTimeout(() => {
+        if (!this.enabled) return;
+        this.playOne(name, vol);
+        scheduleNext(); // re-arm
+      }, this.rdelay(this.ranges[name]));
+      this.timers.push(t);
+    };
+    scheduleNext();
+  }
+
+  start() {
+    if (this.enabled) return;
+    this.enabled = true;
+    // Start background loop
+    this.bg.currentTime = 0;
+    this.bg.play().catch(() => { /* will succeed after user click */ });
+
+    // Schedule layered one-shots
+    this.schedule('owl',     0.85);
+    this.schedule('raven',   0.75);
+    this.schedule('monster', 0.85);
+  }
+
+  stop() {
+    this.enabled = false;
+    // stop bg
+    this.bg.pause();
+    this.bg.currentTime = 0;
+    // clear timers
+    this.timers.forEach(t => clearTimeout(t));
+    this.timers.length = 0;
+  }
+
+  toggle() { this.enabled ? this.stop() : this.start(); }
+}
+
+// Instantiate + wire the button
+const sound = new SoundMgr();
+const sndBtn = document.getElementById('soundToggle');
+sndBtn.style.background = '#1a3';   // your original badge color
+if (sndBtn) {
+  sndBtn.addEventListener('click', () => {
+    sound.toggle();
+    // update badge look
+    if (sound.enabled) {
+      sndBtn.textContent = 'sound: on';
+      sndBtn.style.background = '#1a3';   // green-ish
+    } else {
+      sndBtn.textContent = 'sound: off';
+      sndBtn.style.background = '#1a3';   // your original badge color
+    }
+  });
+}
+
+
+class SpiderActor {
+  constructor(runner){
+    this.runner = runner;
+    this.scale = rr(0.5, 0.8);            // size variation
+    this.bobA = rr(2, 5);                 // tiny lateral bob
+    this.bobF = rr(2, 3.5);
+    this.respawn();
+  }
+
+  // spawn just off one edge so it crosses the whole screen
+  respawn(){
+    const W = canvas.width / dpr, H = canvas.height / dpr;
+    const M = 120;                         // offscreen margin
+    this.angle = Math.random() * Math.PI * 2;
+    const vx = Math.cos(this.angle), vy = Math.sin(this.angle);
+
+    if (Math.abs(vx) >= Math.abs(vy)) {
+      // mostly horizontal travel
+      this.x = (vx > 0) ? -M : W + M;
+      this.y = rr(0.15*H, 0.95*H);
+    } else {
+      // mostly vertical travel
+      this.x = rr(0.05*W, 0.95*W);
+      this.y = (vy > 0) ? -M : H + M;
+    }
+
+    const speed = rr(40, 85);              // px/s
+    this.vx = 1.8 * this.scale * speed * vx;
+    this.vy = 1.8 * this.scale * speed * vy;
+    this.t0 = now();
+  }
+
+  update(dt){
+    this.runner.step(dt);
+    // forward motion
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+
+    // subtle bob perpendicular to travel (looks more alive)
+    const t = now() - this.t0;
+    const px = -Math.sin(this.angle), py = Math.cos(this.angle); // perp
+    const bob = Math.sin(t * this.bobF) * this.bobA * dt;
+    this.x += px * bob;
+    this.y += py * bob;
+
+    // recycle when fully offscreen
+    const W = canvas.width / dpr, H = canvas.height / dpr, M = 160;
+    if (this.x < -M || this.x > W + M || this.y < -M || this.y > H + M) {
+      this.respawn();
+    }
+  }
+
+  draw(ctx){
+    this.runner.draw(ctx, this.x, this.y, this.scale, this.angle, true);
+  }
+}
+
+
 
   // =============================================================
   // Canvas & assets
@@ -223,19 +457,61 @@
       // Clip to eye oval
       ctx.beginPath(); ctx.arc(0,0, scleraR, 0, Math.PI*2); ctx.clip();
 
-      // Sclera
-      const gradS = ctx.createRadialGradient(-scleraR*0.2, -scleraR*0.2, scleraR*0.2, 0, 0, scleraR);
-      gradS.addColorStop(0, '#f9fbff'); gradS.addColorStop(1, '#cfd7e6');
-      ctx.fillStyle = gradS; ctx.fillRect(-scleraR, -scleraR, scleraR*2, scleraR*2);
+      // // Sclera
+      // const gradS = ctx.createRadialGradient(-scleraR*0.2, -scleraR*0.2, scleraR*0.2, 0, 0, scleraR);
+      // gradS.addColorStop(0, '#f9fbff'); gradS.addColorStop(1, '#cfd7e6');
+      // ctx.fillStyle = gradS; ctx.fillRect(-scleraR, -scleraR, scleraR*2, scleraR*2);
 
-      // Iris
+      // Sclera (spooky red tint + darker edges)
+      const gradS = ctx.createRadialGradient(-scleraR * 0.2, -scleraR * 0.2, scleraR * 0.2, 0, 0, scleraR);
+
+      // Soft off-white center with pinkish edges
+      gradS.addColorStop(0, '#fff5f5'); // pale with slight red
+      gradS.addColorStop(0.7, '#e6b3b3'); // pink tint
+      gradS.addColorStop(1, '#4d0000'); // deep red/black edge
+
+      ctx.fillStyle = gradS;
+      ctx.fillRect(-scleraR, -scleraR, scleraR * 2, scleraR * 2);
+
+      // Optional blood vessels
+      ctx.strokeStyle = 'rgba(200,0,0,0.3)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 5; i++) { // tweak count
+        ctx.beginPath();
+        let startX = (Math.random() - 0.5) * scleraR * 1.5;
+        let startY = (Math.random() - 0.5) * scleraR * 1.5;
+        ctx.moveTo(startX, startY);
+        for (let j = 0; j < 3; j++) { // squiggle
+          startX += (Math.random() - 0.5) * 10;
+          startY += (Math.random() - 0.5) * 10;
+          ctx.lineTo(startX, startY);
+        }
+        ctx.stroke();
+      }
+
+      // // Iris (blue theme)
+      // const ix = (this.pcX - this.x) / 1.12;
+      // const iy = (this.pcY - this.y) / 0.96;
+      // const gradI = ctx.createRadialGradient(ix, iy, irisR*0.15, ix, iy, irisR);
+      // gradI.addColorStop(0, '#a9cfe9');
+      // gradI.addColorStop(0.55, '#1b5d7e');
+      // gradI.addColorStop(1, '#0b2432');
+      // ctx.beginPath(); ctx.arc(ix, iy, irisR, 0, Math.PI*2); ctx.fillStyle = gradI; ctx.fill();
+
+      // Iris (red theme)
       const ix = (this.pcX - this.x) / 1.12;
       const iy = (this.pcY - this.y) / 0.96;
-      const gradI = ctx.createRadialGradient(ix, iy, irisR*0.15, ix, iy, irisR);
-      gradI.addColorStop(0, '#a9cfe9');
-      gradI.addColorStop(0.55, '#1b5d7e');
-      gradI.addColorStop(1, '#0b2432');
-      ctx.beginPath(); ctx.arc(ix, iy, irisR, 0, Math.PI*2); ctx.fillStyle = gradI; ctx.fill();
+      const gradI = ctx.createRadialGradient(ix, iy, irisR * 0.15, ix, iy, irisR);
+
+      // Replace blues with reds
+      gradI.addColorStop(0, '#ffcccc');  // pale red/pink highlight
+      gradI.addColorStop(0.55, '#b30000'); // deep red
+      gradI.addColorStop(1, '#330000');   // near black/dark maroon
+
+      ctx.beginPath();
+      ctx.arc(ix, iy, irisR, 0, Math.PI * 2);
+      ctx.fillStyle = gradI;
+      ctx.fill();
 
       // Limbal ring
       ctx.lineWidth = limbalW; ctx.strokeStyle = 'rgba(10,20,30,0.9)';
@@ -246,7 +522,7 @@
       ctx.globalAlpha = 0.6; ctx.beginPath(); ctx.arc(ix - pupilR*0.5, iy - pupilR*0.6, pupilR*0.35, 0, Math.PI*2); ctx.fillStyle = '#fff'; ctx.fill(); ctx.globalAlpha = 1;
 
       // Eyelids
-      if (blinkAmt > 0){ const h = scleraR * blinkAmt; ctx.fillStyle = '#000'; ctx.fillRect(-scleraR-2, -scleraR-2, scleraR*2+4, h+2); ctx.fillRect(-scleraR-2, scleraR-h-0, scleraR*2+4, h+2); }
+      if (blinkAmt > 0){ const h = scleraR * blinkAmt; ctx.fillStyle = '#794618'; ctx.fillRect(-scleraR-2, -scleraR-2, scleraR*2+4, h+2); ctx.fillRect(-scleraR-2, scleraR-h-0, scleraR*2+4, h+2); }
       ctx.restore();
 
       // Outer shadow
@@ -256,6 +532,12 @@
 
   // Create eyes
   const eyes = CONFIG.eyes.map((def,i)=> new Eye(def,i));
+
+  // Create spiders
+  const spiderRunner = new SpriteRunner(
+    spiderSheet, SPRITE.cols, SPRITE.rows, SPRITE.total, SPRITE.fps
+  );
+  const spiders = Array.from({length: SPRITE.count}, () => new SpiderActor(spiderRunner));
 
   // =============================================================
   // Camera + MediaPipe Face Landmarker
@@ -354,11 +636,26 @@
   let lastT = now();
   function frame(){
     const t = now(); const dt = Math.min(0.05, t - lastT); lastT = t;
-    if (bgReady) ctx.drawImage(bg, 0, 0); else { ctx.fillStyle = '#05080a'; ctx.fillRect(0,0,canvas.width/dpr, canvas.height/dpr); }
+
+    // BACKGROUND
+    if (bgReady) ctx.drawImage(bg, 0, 0);
+    else { ctx.fillStyle = '#05080a'; ctx.fillRect(0,0,canvas.width/dpr, canvas.height/dpr); }
+
+    // EYES
     for (const e of eyes){ e.update(dt, t, brightness); e.draw(ctx); }
+
+    // FOREGROUND MASK
     if (fgReady) ctx.drawImage(fg, 0, 0);
+
+    // LAYER A: spiders behind eyes (crawl “on the scene” but under the pumpkin overlay)
+    if (spiderReady) { for (const s of spiders){ s.update(dt); s.draw(ctx); } }
+
+    // LAYER B: spiders on top of everything (uncomment to crawl over pumpkins)
+    // if (spiderReady) { for (const s of spiders){ s.draw(ctx); } }
+
     requestAnimationFrame(frame);
   }
+
 
   // Kickoff
   await initCameraAndTracker();
